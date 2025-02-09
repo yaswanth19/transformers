@@ -14,7 +14,8 @@
 """Janus model configuration"""
 import copy
 import os
-from typing import Any, Dict, Optional, Union
+from dataclasses import field
+from typing import Any, Dict, Optional, Union, List
 
 from ...configuration_utils import PretrainedConfig
 from ...utils import logging
@@ -272,11 +273,80 @@ class JanusTextConfig(PretrainedConfig):
             **kwargs,
         )
 
-class JanusDecoderVisionConfig(PretrainedConfig):
-    """A custom VQ config model"""
-    # TODO
-    def __init__(self):
-        pass
+class JanusGenHeadConfig(PretrainedConfig):
+    r"""
+    This is the class to store the configuration of a [`JanusGenHead`]. This submodel is used to map
+    hidden states output by the language model to logits for the image tokens, which will be used for sampling
+    image-patch tokens.
+    """
+    model_type = "janus_gen_head"
+    base_config_key = "gen_head_config"
+    def __init__(self,
+                 image_token_embed=4096,
+                 image_token_size=16384,
+                 n_embed=4096,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.image_token_embed = image_token_embed
+        self.image_token_size = image_token_size
+        self.n_embed = n_embed
+
+class JanusGenAlignerConfig(PretrainedConfig):
+    r"""
+    This is the class to store the configuration of a [`JanusGenAligner`]. First the image logits from `JanusGenHead`
+    are used to sample image tokens, they are then used to select embeddings, which are subsequently passed to the
+    `JanusGenAligner`, the submodel responsible for mapping the semantic features from the generative/understanding
+    encoders to the feature-space used by the LLM. The output of the aligner goes to a deconvolutional network
+    to generate the final images.
+    """
+    model_type = "janus_gen_aligner"
+    base_config_key = "gen_aligner_config"
+    def __init__(self,
+                 depth=2,
+                 input_dim=8,
+                 n_embed=4096,
+                 projector_type="mlp_gelu",
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.depth = depth
+        self.input_dim = input_dim
+        self.n_embed = n_embed
+        self.projector_type = projector_type
+
+class JanusGenVisionConfig(PretrainedConfig):
+    r"""
+    This is the class to store the configuration of a [`JanusGenVision`]. This submodel is used to map
+    aligned features to images via deconvolutional layers.
+    """
+    model_type = "janus_gen_vision"
+    base_config_key = "gen_vision_config"
+
+    def __init__(
+        self,
+        codebook_size: int = 16384,
+        codebook_embed_dim: int = 8,
+        codebook_l2_norm: bool = True,
+        codebook_show_usage: bool = True,
+        commit_loss_beta: float = 0.25,
+        entropy_loss_ratio: float = 0.0,
+        encoder_ch_mult: Optional[List[int]] = None,
+        decoder_ch_mult: Optional[List[int]] = None,
+        z_channels: int = 256,
+        dropout_p: float = 0.0,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.encoder_ch_mult = encoder_ch_mult if encoder_ch_mult is not None else [1, 1, 2, 2, 4]
+        self.decoder_ch_mult = decoder_ch_mult if decoder_ch_mult is not None else [1, 1, 2, 2, 4]
+        self.codebook_size = codebook_size
+        self.codebook_embed_dim = codebook_embed_dim
+        self.codebook_l2_norm = codebook_l2_norm
+        self.codebook_show_usage = codebook_show_usage
+        self.commit_loss_beta = commit_loss_beta
+        self.entropy_loss_ratio = entropy_loss_ratio
+        self.z_channels = z_channels
+        self.dropout_p = dropout_p
+
 
 class JanusConfig(PretrainedConfig):
     r"""
@@ -334,25 +404,29 @@ class JanusConfig(PretrainedConfig):
     ```"""
 
     model_type = "janus"
-    sub_configs = {"text_config": JanusTextConfig, "encoder_vision_config": JanusEncoderVisionConfig, "decoder_vision_config": JanusDecoderVisionConfig}
+    sub_configs = {"text_config": JanusTextConfig,
+                   "encoder_vision_config": JanusEncoderVisionConfig,
+                   "gen_head_config": JanusGenHeadConfig,
+                   "gen_aligner_config": JanusGenAlignerConfig,
+                   "gen_vision_config": JanusGenVisionConfig
+                   }
 
-    def __init__(self, text_config, encoder_vision_config,decoder_vision_config, **kwargs):
+    def __init__(self, text_config, encoder_vision_config,
+                 gen_head_config, gen_aligner_config, gen_vision_config, **kwargs):
         super.__init__(**kwargs)
 
-        if text_config is None:
-            text_config = {}
-            logger.info("`text_config` is None. Initializaing with default JanusTextConfig values")
-
-        if encoder_vision_config is None:
-            encoder_vision_config = {}
-            logger.info("`encodr_vision_config` is None. Initializaing with default JanusEncoderVisionConfig values")
-
-        if decoder_vision_config is None:
-            decoder_vision_config = {}
-            logger.info("`text_config` is None. Initializaing with default JanusDecoderVisionConfig values")
+        for config_name, config_class in self.sub_configs.items():
+            if locals()[config_name] is None:
+                locals()[config_name] = {}
+                logger.info(f"`{config_name}` is None. Initializing with default {config_class.__name__} values")
+                locals()[config_name] = config_class(**locals()[config_name])
 
         text_config = JanusTextConfig(**text_config)
         encoder_vision_config = JanusEncoderVisionConfig(**encoder_vision_config)
-        decoder_vision_config = JanusDecoderVisionConfig(**decoder_vision_config)
+        gen_head_config = JanusGenHeadConfig(**gen_head_config)
+        gen_aligner_config = JanusGenAlignerConfig(**gen_aligner_config)
+        gen_vision_config = JanusGenVisionConfig(**gen_vision_config)
 
-__all__ = ["JanusDecoderVisionConfig","JanusTextConfig","JanusEncoderVisionConfig","JanusConfig"]
+
+__all__ = ["JanusGenHeadConfig", "JanusGenAlignerConfig", "JanusGenVisionConfig",
+           "JanusTextConfig", "JanusEncoderVisionConfig", "JanusConfig"]
