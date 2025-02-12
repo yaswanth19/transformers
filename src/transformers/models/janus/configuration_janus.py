@@ -410,6 +410,7 @@ class JanusConfig(PretrainedConfig):
     ```"""
 
     model_type = "janus"
+    keys_to_ignore_at_inference = ["past_key_values"]
     sub_configs = {"text_config": JanusTextConfig,
                    "encoder_vision_config": JanusVisionEncoderConfig,
                    "gen_head_config": JanusGenHeadConfig,
