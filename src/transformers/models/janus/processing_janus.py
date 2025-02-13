@@ -68,7 +68,8 @@ class JanusProcessorKwargs(ProcessingKwargs, total=False):
     _defaults = {
         "text_kwargs": {
             "padding": False,
-            "return_tensors":"pt"
+            "return_tensors":"pt",
+            "return_for_image_generation": False
         }
     }
 
@@ -126,6 +127,10 @@ class JanusProcessor(ProcessorMixin):
                 text = [text]
             elif not (isinstance(text, (list, tuple)) and all(isinstance(t, str) for t in text)):
                 raise ValueError("Invalid input text. Please provide a string, or a list of strings")
+
+        return_for_image_generation = output_kwargs["text_kwargs"].pop("return_for_image_generation", False)
+        if return_for_image_generation:
+            text = [f"{sample}{self.image_start_token}" for sample in text]
 
         # Replace the image token with explanded imaeg tokens.
         prompt_strings = []

@@ -936,10 +936,6 @@ class JanusVisionEncoder(nn.Module):
         )
 
 
-class JanusPreTrainedModel():
-     """An abstract class to load pretrained weigths"""
-     pass
-
 # Copied from siglip vision transformer
 class JanusVisionEncoderTransformer(nn.Module):
     def __init__(self, config: JanusVisionEncoderConfig):
