@@ -16,22 +16,22 @@
 Processor class for Janus.
 """
 
-from ...image_utils import is_valid_image
+from typing import List, Union
+
+import torch
+
 from ...feature_extraction_utils import BatchFeature
-from ...image_processing_utils import select_best_resolution
-from ...image_utils import ImageInput, VideoInput, get_image_size, to_numpy_array
-from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
-from ...tokenization_utils_base import PaddingStrategy, PreTokenizedInput, TextInput, TruncationStrategy
-from ...utils import TensorType, logging
-from typing import TYPE_CHECKING, List, Optional, Union
+from ...image_utils import ImageInput, is_valid_image
 from ...processing_utils import (
+    ProcessingKwargs,
     ProcessorMixin,
+    Unpack,
 )
 from ...tokenization_utils_base import (
-    AddedToken,
+    PreTokenizedInput,
+    TextInput,
 )
 from ...utils import logging
-import torch
 
 
 logger = logging.get_logger(__name__)
@@ -39,16 +39,17 @@ logger = logging.get_logger(__name__)
 IMAGE_TOKEN = "<image_placeholder>"
 
 DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful language and vision assistant. "
-        "You are able to understand the visual content that the user provides, "
-        "and assist the user with a variety of tasks using natural language.\n\n"
-    )
+    "You are a helpful language and vision assistant. "
+    "You are able to understand the visual content that the user provides, "
+    "and assist the user with a variety of tasks using natural language."
+)
 
 # messages = [{"role":"User",
 #   "content":[{'type':"text","text":"<image_placeholder>\nConvert the formula into latex code.\n"}]},
 #   {"role": "Assistant", "content": " "},
 # ]
 # Here as  a hack I have added \n after user content but ideally chat template should add it
+
 
 # Copied from transformers.models.idefics2.processing_idefics2.is_url
 def is_url(val) -> bool:
@@ -63,15 +64,11 @@ def is_image_or_image_url(elem):
 def _is_str_or_image(elem):
     return isinstance(elem, (str)) or is_image_or_image_url(elem)
 
+
 class JanusProcessorKwargs(ProcessingKwargs, total=False):
     # see processing_utils.ProcessingKwargs documentation for usage.
-    _defaults = {
-        "text_kwargs": {
-            "padding": False,
-            "return_tensors":"pt",
-            "return_for_image_generation": False
-        }
-    }
+    _defaults = {"text_kwargs": {"padding": False, "return_tensors": "pt", "return_for_image_generation": False}}
+
 
 class JanusProcessor(ProcessorMixin):
     r"""
@@ -94,13 +91,13 @@ class JanusProcessor(ProcessorMixin):
     image_processor_class = "JanusImageProcessor"
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
 
-    def __init__(self, image_processor, tokenizer, chat_template=None,use_default_system_prompt=True, **kwargs):
+    def __init__(self, image_processor, tokenizer, chat_template=None, use_default_system_prompt=True, **kwargs):
         if image_processor is None:
             raise ValueError("You need to specify an `image_processor`.")
         if tokenizer is None:
             raise ValueError("You need to specify a `tokenizer`.")
 
-        self.num_image_tokens = 10 # revert back to 576 or fetch from pre_processor config
+        self.num_image_tokens = 10  # revert back to 576 or fetch from pre_processor config
         self.image_start_token = "<begin_of_image>"
         self.image_end_token = "<end_of_image>"
         self.use_default_system_prompt = use_default_system_prompt
@@ -111,15 +108,16 @@ class JanusProcessor(ProcessorMixin):
         self,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]],
         images: ImageInput = None,
-        **kwargs: Unpack[JanusProcessorKwargs]
+        **kwargs: Unpack[JanusProcessorKwargs],
     ) -> BatchFeature:
         """Construct a Janus processor with JanusImage procesor and Llama text tokenizer"""
 
-        output_kwargs = self._merge_kwargs(JanusProcessorKwargs,tokenizer_init_kwargs=self.tokenizer.init_kwargs,**kwargs)
+        output_kwargs = self._merge_kwargs(
+            JanusProcessorKwargs, tokenizer_init_kwargs=self.tokenizer.init_kwargs, **kwargs
+        )
 
         if text is None and images is None:
             raise ValueError("You must specify either text or images.")
-
 
         data = {}
         if text is not None:
@@ -142,12 +140,11 @@ class JanusProcessor(ProcessorMixin):
                 sample = DEFAULT_SYSTEM_PROMPT + sample
             prompt_strings.append(sample)
 
-
-        data = self.tokenizer(prompt_strings,**output_kwargs['text_kwargs'])
+        data = self.tokenizer(prompt_strings, **output_kwargs["text_kwargs"])
 
         if images is not None:
             # How to pass image kwargs and it returns the pixel values aso append it to the output.
-            data['pixel_values'] = self.image_processor(images=images,return_tensors="pt")['pixel_values']
+            data["pixel_values"] = self.image_processor(images=images, return_tensors="pt")["pixel_values"]
 
         input_ids = data["input_ids"]
         batch_size, _ = input_ids.shape
@@ -160,7 +157,7 @@ class JanusProcessor(ProcessorMixin):
         images_seq_mask = (input_ids == image_token_id) | (input_ids == image_start_id)
 
         # Compute image embedding mask dynamically
-        max_n_images = max(1,len(images))
+        max_n_images = max(1, len(images))
         images_emb_mask = torch.zeros((batch_size, max_n_images, self.num_image_tokens + 1), dtype=torch.bool)
 
         for i in range(batch_size):
@@ -174,10 +171,7 @@ class JanusProcessor(ProcessorMixin):
             data["pixel_values"] = self.image_processor(images=images, return_tensors="pt")["pixel_values"]
 
         # Add masks to the output
-        data.update({
-            "images_seq_mask": images_seq_mask,
-            "images_emb_mask": images_emb_mask
-        })
+        data.update({"images_seq_mask": images_seq_mask, "images_emb_mask": images_emb_mask})
 
         return BatchFeature(data=data)
 

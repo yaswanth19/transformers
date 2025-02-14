@@ -558,11 +558,7 @@ _import_structure = {
         "LlavaConfig",
         "LlavaProcessor",
     ],
-    "models.janus": [
-        "JanusConfig",
-        "JanusImageProcessor",
-        "JanusProcessor"
-    ],
+    "models.janus": ["JanusConfig", "JanusImageProcessor", "JanusProcessor"],
     "models.llava_next": [
         "LlavaNextConfig",
         "LlavaNextProcessor",

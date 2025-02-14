@@ -1,20 +1,33 @@
-from transformers import PreTrainedModel, GenerationMixin
-from .configuration_janus import JanusConfig, JanusGenVisionConfig
+from typing import Optional, Tuple, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
+
+from ...activations import ACT2FN
+from ...generation import GenerationMixin
+from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
+from ...modeling_utils import PreTrainedModel
+from ..dinov2_with_registers.modeling_dinov2_with_registers import (
+    Dinov2WithRegistersDropPath,
+    Dinov2WithRegistersLayerScale,
+)
+from ..vit.modeling_vit import ViTPatchEmbeddings
+from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusVisionEncoderConfig
+
 
 class JanusGenVisionEncoder(nn.Module):
     def __init__(
-        self,
-        in_channels=3,
-        ch=128,
-        ch_mult=(1, 1, 2, 2, 4),
-        num_res_blocks=2,
-        norm_type="group",
-        dropout=0.0,
-        resamp_with_conv=True,
-        z_channels=256,
+            self,
+            in_channels=3,
+            ch=128,
+            ch_mult=(1, 1, 2, 2, 4),
+            num_res_blocks=2,
+            norm_type="group",
+            dropout=0.0,
+            resamp_with_conv=True,
+            z_channels=256,
     ):
         super().__init__()
         self.num_resolutions = len(ch_mult)
@@ -32,11 +45,7 @@ class JanusGenVisionEncoder(nn.Module):
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
             for _ in range(self.num_res_blocks):
-                res_block.append(
-                    JanusGenVisionResnetBlock(
-                        block_in, block_out, dropout=dropout, norm_type=norm_type
-                    )
-                )
+                res_block.append(JanusGenVisionResnetBlock(block_in, block_out, dropout=dropout, norm_type=norm_type))
                 block_in = block_out
                 if i_level == self.num_resolutions - 1:
                     attn_block.append(JanusGenVisionAttnBlock(block_in, norm_type))
@@ -49,19 +58,13 @@ class JanusGenVisionEncoder(nn.Module):
 
         # middle
         self.mid = nn.ModuleList()
-        self.mid.append(
-            JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type)
-        )
+        self.mid.append(JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type))
         self.mid.append(JanusGenVisionAttnBlock(block_in, norm_type=norm_type))
-        self.mid.append(
-            JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type)
-        )
+        self.mid.append(JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type))
 
         # end
         self.norm_out = JanusGenVisionNormalize(block_in, norm_type)
-        self.conv_out = nn.Conv2d(
-            block_in, z_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_out = nn.Conv2d(block_in, z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
         h = self.conv_in(x)
@@ -87,15 +90,15 @@ class JanusGenVisionEncoder(nn.Module):
 
 class JanusGenVisionDecoder(nn.Module):
     def __init__(
-        self,
-        z_channels=256,
-        ch=128,
-        ch_mult=(1, 1, 2, 2, 4),
-        num_res_blocks=2,
-        norm_type="group",
-        dropout=0.0,
-        resamp_with_conv=True,
-        out_channels=3,
+            self,
+            z_channels=256,
+            ch=128,
+            ch_mult=(1, 1, 2, 2, 4),
+            num_res_blocks=2,
+            norm_type="group",
+            dropout=0.0,
+            resamp_with_conv=True,
+            out_channels=3,
     ):
         super().__init__()
         self.num_resolutions = len(ch_mult)
@@ -103,19 +106,13 @@ class JanusGenVisionDecoder(nn.Module):
 
         block_in = ch * ch_mult[self.num_resolutions - 1]
         # z to block_in
-        self.conv_in = nn.Conv2d(
-            z_channels, block_in, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
 
         # middle
         self.mid = nn.ModuleList()
-        self.mid.append(
-            JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type)
-        )
+        self.mid.append(JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type))
         self.mid.append(JanusGenVisionAttnBlock(block_in, norm_type=norm_type))
-        self.mid.append(
-            JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type)
-        )
+        self.mid.append(JanusGenVisionResnetBlock(block_in, block_in, dropout=dropout, norm_type=norm_type))
 
         # upsampling
         self.conv_blocks = nn.ModuleList()
@@ -126,11 +123,7 @@ class JanusGenVisionDecoder(nn.Module):
             attn_block = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
             for _ in range(self.num_res_blocks + 1):
-                res_block.append(
-                    JanusGenVisionResnetBlock(
-                        block_in, block_out, dropout=dropout, norm_type=norm_type
-                    )
-                )
+                res_block.append(JanusGenVisionResnetBlock(block_in, block_out, dropout=dropout, norm_type=norm_type))
                 block_in = block_out
                 if i_level == self.num_resolutions - 1:
                     attn_block.append(JanusGenVisionAttnBlock(block_in, norm_type))
@@ -143,9 +136,7 @@ class JanusGenVisionDecoder(nn.Module):
 
         # end
         self.norm_out = JanusGenVisionNormalize(block_in, norm_type)
-        self.conv_out = nn.Conv2d(
-            block_in, out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_out = nn.Conv2d(block_in, out_channels, kernel_size=3, stride=1, padding=1)
 
     @property
     def last_layer(self):
@@ -188,9 +179,7 @@ class JanusGenVisionVectorQuantizer(nn.Module):
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
         if self.l2_norm:
-            self.embedding.weight.data = F.normalize(
-                self.embedding.weight.data, p=2, dim=-1
-            )
+            self.embedding.weight.data = F.normalize(self.embedding.weight.data, p=2, dim=-1)
         if self.show_usage:
             self.register_buffer("codebook_used", nn.Parameter(torch.zeros(65536)))
 
@@ -208,12 +197,9 @@ class JanusGenVisionVectorQuantizer(nn.Module):
             embedding = self.embedding.weight
 
         d = (
-            torch.sum(z_flattened**2, dim=1, keepdim=True)
-            + torch.sum(embedding**2, dim=1)
-            - 2
-            * torch.einsum(
-                "bd,dn->bn", z_flattened, torch.einsum("n d -> d n", embedding)
-            )
+                torch.sum(z_flattened ** 2, dim=1, keepdim=True)
+                + torch.sum(embedding ** 2, dim=1)
+                - 2 * torch.einsum("bd,dn->bn", z_flattened, torch.einsum("n d -> d n", embedding))
         )
 
         min_encoding_indices = torch.argmin(d, dim=1)
@@ -262,12 +248,12 @@ class JanusGenVisionVectorQuantizer(nn.Module):
 
 class JanusGenVisionResnetBlock(nn.Module):
     def __init__(
-        self,
-        in_channels,
-        out_channels=None,
-        conv_shortcut=False,
-        dropout=0.0,
-        norm_type="group",
+            self,
+            in_channels,
+            out_channels=None,
+            conv_shortcut=False,
+            dropout=0.0,
+            norm_type="group",
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -276,24 +262,16 @@ class JanusGenVisionResnetBlock(nn.Module):
         self.use_conv_shortcut = conv_shortcut
 
         self.norm1 = JanusGenVisionNormalize(in_channels, norm_type)
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
         self.norm2 = JanusGenVisionNormalize(out_channels, norm_type)
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                self.conv_shortcut = nn.Conv2d(
-                    in_channels, out_channels, kernel_size=3, stride=1, padding=1
-                )
+                self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
             else:
-                self.nin_shortcut = nn.Conv2d(
-                    in_channels, out_channels, kernel_size=1, stride=1, padding=0
-                )
+                self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         h = x
@@ -320,9 +298,7 @@ class JanusGenVisionAttnBlock(nn.Module):
         self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
-        self.proj_out = nn.Conv2d(
-            in_channels, in_channels, kernel_size=1, stride=1, padding=0
-        )
+        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         h_ = x
@@ -359,9 +335,7 @@ def janus_gen_vision_nonlinearity(x):
 def JanusGenVisionNormalize(in_channels, norm_type="group"):
     assert norm_type in ["group", "batch"]
     if norm_type == "group":
-        return nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
-        )
+        return nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
     elif norm_type == "batch":
         return nn.SyncBatchNorm(in_channels)
 
@@ -371,15 +345,11 @@ class JanusGenVisionUpsample(nn.Module):
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
-            self.conv = nn.Conv2d(
-                in_channels, in_channels, kernel_size=3, stride=1, padding=1
-            )
+            self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
         if x.dtype != torch.float32:
-            x = F.interpolate(x.to(torch.float), scale_factor=2.0, mode="nearest").to(
-                torch.bfloat16
-            )
+            x = F.interpolate(x.to(torch.float), scale_factor=2.0, mode="nearest").to(torch.bfloat16)
         else:
             x = F.interpolate(x, scale_factor=2.0, mode="nearest")
 
@@ -394,9 +364,7 @@ class JanusGenVisionDownsample(nn.Module):
         self.with_conv = with_conv
         if self.with_conv:
             # no asymmetric padding in torch conv, must do it ourselves
-            self.conv = nn.Conv2d(
-                in_channels, in_channels, kernel_size=3, stride=2, padding=0
-            )
+            self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
     def forward(self, x):
         if self.with_conv:
@@ -429,7 +397,6 @@ class JanusGenVision(PreTrainedModel):
     base_model_prefix = "janus_gen_vision"
     main_input_name = "pixel_values"
 
-
     def __init__(self, config: JanusGenVisionConfig):
         super().__init__()
         self.config = config
@@ -454,9 +421,7 @@ class JanusGenVision(PreTrainedModel):
         )
 
         self.quant_conv = nn.Conv2d(config.z_channels, config.codebook_embed_dim, 1)
-        self.post_quant_conv = nn.Conv2d(
-            config.codebook_embed_dim, config.z_channels, 1
-        )
+        self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, config.z_channels, 1)
 
     def encode(self, x):
         h = self.encoder(x)
@@ -487,6 +452,7 @@ class JanusPreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         pass
 
+
 class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
     config_class = JanusConfig
 
@@ -497,48 +463,11 @@ class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
         pass
 
 
-
-__all__ = [
-    "JanusGenVision",
-    "JanusPreTrainedModel",
-    "JanusForConditionalGeneration"
-]
-import math
-import warnings
-from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
-
-import numpy as np
-import torch
-import torch.utils.checkpoint
-from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from torch.nn.init import _calculate_fan_in_and_fan_out
-
-from ...activations import ACT2FN
-from ...modeling_attn_mask_utils import _prepare_4d_attention_mask
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ImageClassifierOutput
-from ...modeling_utils import PreTrainedModel
-from ...utils import (
-    ModelOutput,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    is_flash_attn_2_available,
-    is_flash_attn_greater_or_equal_2_10,
-    logging,
-    replace_return_docstrings,
-    torch_int,
-)
-
-from .configuration_janus import JanusVisionEncoderConfig
-from ..vit.modeling_vit import ViTPatchEmbeddings
-from ..dinov2_with_registers.modeling_dinov2_with_registers  import Dinov2WithRegistersLayerScale, Dinov2WithRegistersDropPath
-from ..siglip.modeling_siglip import SiglipEncoder, SiglipVisionTransformer, SiglipVisionModel, SiglipMultiheadAttentionPoolingHead
-
 class PatchDropout(nn.Module):
     """
     https://arxiv.org/abs/2212.00794 and https://arxiv.org/pdf/2208.07220
     """
+
     return_indices: torch.jit.Final[bool]
 
     def __init__(
@@ -549,26 +478,26 @@ class PatchDropout(nn.Module):
             return_indices: bool = False,
     ):
         super().__init__()
-        assert 0 <= prob < 1.
+        assert 0 <= prob < 1.0
         self.prob = prob
         self.num_prefix_tokens = num_prefix_tokens  # exclude CLS token (or other prefix tokens)
         self.ordered = ordered
         self.return_indices = return_indices
 
     def forward(self, x) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        if not self.training or self.prob == 0.:
+        if not self.training or self.prob == 0.0:
             if self.return_indices:
                 return x, None
             return x
 
         if self.num_prefix_tokens:
-            prefix_tokens, x = x[:, :self.num_prefix_tokens], x[:, self.num_prefix_tokens:]
+            prefix_tokens, x = x[:, : self.num_prefix_tokens], x[:, self.num_prefix_tokens:]
         else:
             prefix_tokens = None
 
         B = x.shape[0]
         L = x.shape[1]
-        num_keep = max(1, int(L * (1. - self.prob)))
+        num_keep = max(1, int(L * (1.0 - self.prob)))
         keep_indices = torch.argsort(torch.randn(B, L, device=x.device), dim=-1)[:, :num_keep]
         if self.ordered:
             # NOTE does not need to maintain patch order in typical transformer use,
@@ -583,17 +512,22 @@ class PatchDropout(nn.Module):
             return x, keep_indices
         return x
 
+
 class JanusVisionEncoderPatchEmbeddings(ViTPatchEmbeddings):
     pass
 
 
 class JanusVisionEncoderEmbeddings(nn.Module):
-    def __init__(self, config:JanusVisionEncoderConfig, use_special_tokens: bool,):
+    def __init__(
+            self,
+            config: JanusVisionEncoderConfig,
+            use_special_tokens: bool,
+    ):
         super().__init__()
 
         self.use_special_tokens = use_special_tokens
         if use_special_tokens:
-            self.cls_token = nn.Parameter(torch.rand(1,1,config.hidden_size))
+            self.cls_token = nn.Parameter(torch.rand(1, 1, config.hidden_size))
             self.register_tokens = nn.Parameter(torch.zeros(1, config.num_register_tokens, config.hidden_size))
 
         # Currently using hidden_drop_rate instead of positional_dropout_rate, is it necessary?
@@ -606,7 +540,9 @@ class JanusVisionEncoderEmbeddings(nn.Module):
         self.position_embeddings = nn.Parameter(torch.randn(1, pos_embed_len, config.hidden_size) * 0.02)
 
         # Used to reduce computationality.
-        self.patch_dropout = PatchDropout(config.drop_path_rate, num_prefix_tokens) if config.drop_path_rate else nn.Identity()
+        self.patch_dropout = (
+            PatchDropout(config.drop_path_rate, num_prefix_tokens) if config.drop_path_rate else nn.Identity()
+        )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         batch_size, _, height, width = pixel_values.shape
@@ -616,30 +552,31 @@ class JanusVisionEncoderEmbeddings(nn.Module):
         # Add CLS and Register token embeddings.
         special_token_embeddings = []
         if self.use_special_tokens:
-            cls_token_embeddings = self.cls_token.expand((batch_size, -1,-1))
+            cls_token_embeddings = self.cls_token.expand((batch_size, -1, -1))
             special_token_embeddings.append(cls_token_embeddings)
 
             if self.register_tokens.shape[1]:
-                register_token_embeddings = self.register_tokens.expand((batch_size, -1,-1))
+                register_token_embeddings = self.register_tokens.expand((batch_size, -1, -1))
                 special_token_embeddings.append(register_token_embeddings)
 
         if self.use_special_tokens:
             embeddings = embeddings + self.position_embeddings
-            embeddings = torch.cat(special_token_embeddings+[embeddings], dim=1)
+            embeddings = torch.cat(special_token_embeddings + [embeddings], dim=1)
         else:
             # embeddings = torch.cat(special_token_embeddings+[embeddings], dim=1)
             embeddings = embeddings + self.position_embeddings
 
         embeddings = self.dropout(embeddings)
 
-
         # Perform Patch dropout
         embeddings = self.patch_dropout(embeddings)
         return embeddings
 
+
 # Todo: introduce compatiability for cache
 class JanusVisionEncoderAttention(nn.Module):
-    """Attention Class for Janus Vision Encoder """
+    """Attention Class for Janus Vision Encoder"""
+
     def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
         self.config = config
@@ -651,23 +588,32 @@ class JanusVisionEncoderAttention(nn.Module):
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
                 f" {self.num_heads})."
             )
-        self.scale = self.head_dim**-0.5
+        self.scale = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         proj_dropout = config.projection_dropout
         qk_norm = config.use_qk_norm
 
         # Split the weights manually and checkif getting correct output or not
-        self.qkv = nn.Linear(self.embed_dim, 3*self.embed_dim, bias=config.qkv_bias)
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=config.qkv_bias)
         self.projection_layer = nn.Linear(self.embed_dim, self.embed_dim)
         self.projection_dropout = nn.Dropout(proj_dropout) if proj_dropout > 0 else nn.Identity()
 
         self.query_norm = nn.LayerNorm(self.embed_dim) if qk_norm else nn.Identity()
         self.key_norm = nn.LayerNorm(self.embed_dim) if qk_norm else nn.Identity()
 
-    def forward(self,hidden_states:torch.Tensor,attention_mask: Optional[torch.Tensor] = None, output_attentions: Optional[torch.Tensor] = None):
-        batch_size , seq_len, _ = hidden_states.size()
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_attentions: Optional[torch.Tensor] = None,
+    ):
+        batch_size, seq_len, _ = hidden_states.size()
 
-        qkv = self.qkv(hidden_states).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(hidden_states)
+            .reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
         query_states, key_states, value_states = qkv.unbind(0)
 
         query_states = self.query_norm(query_states)
@@ -677,7 +623,7 @@ class JanusVisionEncoderAttention(nn.Module):
         query_states = query_states * self.scale
 
         # batch, num head,seqlen,seqlen
-        attn_weights = torch.matmul(query_states, key_states.transpose(2,3))
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -692,14 +638,14 @@ class JanusVisionEncoderAttention(nn.Module):
                 f" {attn_output.size()}"
             )
         if attention_mask is not None:
-            if attention_mask.size() != (batch_size,1, seq_len, self.head_dim):
+            if attention_mask.size() != (batch_size, 1, seq_len, self.head_dim):
                 raise ValueError(
                     f"Attention mask should be of size {(batch_size, 1, seq_len, self.head_dim)}, but is {attention_mask.size()}"
                 )
             attn_weights = attn_weights + attention_mask
 
-        attn_output = attn_output.transpose(1,2).contiguous()
-        attn_output = attn_output.reshape( batch_size, seq_len, self.embed_dim )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, seq_len, self.embed_dim)
 
         output = self.projection_layer(attn_output)
         output = self.projection_dropout(output)
@@ -707,16 +653,20 @@ class JanusVisionEncoderAttention(nn.Module):
         outputs = (output, attn_weights) if output_attentions else (output, None)
         return outputs
 
+
 class JanusVisionEncoderLayerScale(Dinov2WithRegistersLayerScale):
     pass
+
+
 class JanusVisionEncoderDropPath(Dinov2WithRegistersDropPath):
     pass
 
+
 class JanusVisionEncoderMLP(nn.Module):
-    def __init__(self, config:JanusVisionEncoderConfig):
+    def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
         self.config = config
-        self.activation_fn = ACT2FN[config.hidden_act] # Gelu act
+        self.activation_fn = ACT2FN[config.hidden_act]  # Gelu act
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
         self.dropout1 = nn.Dropout(config.hidden_dropout_rate)
@@ -730,8 +680,9 @@ class JanusVisionEncoderMLP(nn.Module):
         hidden_states = self.dropout2(hidden_states)
         return hidden_states
 
+
 class JanusVisionEncoderLayer(nn.Module):
-    def __init__(self,config: JanusVisionEncoderConfig):
+    def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -751,10 +702,10 @@ class JanusVisionEncoderLayer(nn.Module):
 
     # Ignore copy
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        output_attentions: Optional[bool] = False,
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+            output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor]:
         """
         Args:
@@ -786,12 +737,14 @@ class JanusVisionEncoderLayer(nn.Module):
 
         return (hidden_states, attn_weights if output_attentions else None)
 
+
 # copied from SiglipMultiheadAttentionPoolingHead
 # class JanusAttentionPoolLatent(SiglipMultiheadAttentionPoolingHead):
 #     pass
 
+
 class JanusAttentionPoolLatent(nn.Module):
-    """ Hugging Face-compatible Attention Pooling with Manual QKV """
+    """Hugging Face-compatible Attention Pooling with Manual QKV"""
 
     def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
@@ -830,14 +783,16 @@ class JanusAttentionPoolLatent(nn.Module):
         kv = self.kv_proj(hidden_state)  # (B, seq_len, 2 * hidden_size)
         k, v = kv.view(batch_size, seq_len, 2, self.num_heads, self.head_dim).unbind(2)
         # Batch_sisxe, num_heads, seq_len, head_dim
-        k = k.transpose(1,2)
-        v = v.transpose(1,2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
         # Reshape Q for multi-head attention (B, N, H) → (B, num_heads, N, head_dim)
-        q = q.view(batch_size, self.latent_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, num_heads, latent_len, head_dim)
+        q = q.view(batch_size, self.latent_len, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )  # (B, num_heads, latent_len, head_dim)
 
         # Scaled dot-product attention (without `torch.nn.MultiheadAttention`)
-        attn_weights = (q @ k.transpose(2,3)) * self.scale  # (B, num_heads, latent_len, seq_len)
+        attn_weights = (q @ k.transpose(2, 3)) * self.scale  # (B, num_heads, latent_len, seq_len)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         x = attn_weights @ v  # (B, num_heads, latent_len, head_dim)
 
@@ -856,8 +811,7 @@ class JanusAttentionPoolLatent(nn.Module):
 
 # Copied from siglip encoder
 class JanusVisionEncoder(nn.Module):
-
-    def __init__(self,config:JanusVisionEncoderConfig):
+    def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([JanusVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
@@ -865,12 +819,12 @@ class JanusVisionEncoder(nn.Module):
 
     # Ignore copy
     def forward(
-        self,
-        inputs_embeds,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            inputs_embeds,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
         r"""
         Args:
@@ -941,7 +895,7 @@ class JanusVisionEncoderTransformer(nn.Module):
     def __init__(self, config: JanusVisionEncoderConfig):
         super().__init__()
         self.config = config
-        self.embeddings = JanusVisionEncoderEmbeddings(config,use_special_tokens=False)
+        self.embeddings = JanusVisionEncoderEmbeddings(config, use_special_tokens=False)
         self.encoder = JanusVisionEncoder(config)
         self.layenorm = nn.LayerNorm(config.hidden_size)
         self.use_head = True if not hasattr(config, "vision_use_head") else config.vision_use_head
@@ -950,13 +904,12 @@ class JanusVisionEncoderTransformer(nn.Module):
             # Won't be using as a standalone classifier head hence no num classes
 
     def forward(
-        self,
-        pixel_values,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+            self,
+            pixel_values,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -976,7 +929,6 @@ class JanusVisionEncoderTransformer(nn.Module):
         last_hidden_state = self.layenorm(last_hidden_state)
         pooler_output = self.head(hidden_states)
 
-
         if not return_dict:
             return (last_hidden_state) + encoder_outputs[1:]
 
@@ -986,3 +938,9 @@ class JanusVisionEncoderTransformer(nn.Module):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+
+__all__ = ["JanusGenVision",
+           "JanusPreTrainedModel",
+           "JanusForConditionalGeneration"
+           ]

@@ -31,7 +31,7 @@ from transformers import (
 
 
 EPILOG_TXT = """Example:
-    python transformers/src/transformers/models/janus/convert_janus_weights_to_hf.py --text_model_id lmsys/vicuna-7b-v1.5 --vision_model_id openai/clip-vit-large-patch14-336 --output_hub_path org/janus-v1.5-7b-conv --old_state_dict_id liuhaotian/janus-v1.5-7b
+    python transformers/src/transformers/models/janus/convert_janus_weights_to_hf.py --text_model_id lmsys/vicuna-7b-v1.5 --vision_model_id openai/clip-vit-large-patch14-336 --output_hub_path org/janus-v1.5-7b-conv --old_state_dict_id deepseek-ai/Janus-Pro-7B
 
 Example for creating the old state dict file with Python:
 
@@ -122,9 +122,13 @@ def convert_janus_llama_to_hf(text_model_id, vision_model_id, output_hub_path, o
     else:
         vision_config = None
 
+    """
+    TODO: I added .to_dict() here because **text_config was not working for text_config of type LlamaConfig. Maybe
+    change later.
+    """
     config = JanusConfig(
-        text_config=text_config,
-        vision_config=vision_config,
+        text_config=text_config.to_dict() if text_config else None,
+        encoder_vision_config=vision_config.to_dict() if vision_config else None,
     )
 
     # llms-lab interleeave models do not use any selection startegy except for last hidden state
