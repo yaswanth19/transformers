@@ -1,7 +1,8 @@
 """
 This code tests the logits and intermediary activations to check if importing the module went well.
-It is a temporary file meant to be used with the code from commit number xxxxxx. Later, the way
-the functions that generate images are called will change
+It is a temporary file meant to be used with the code from commit number 68bbfab60d57f1bff1281e9ea8cdbcc0053f0391
+from the branch yaswanth19-add-janus-model in https://github.com/hsilva664/transformers.git. Later, the way the
+functions that generate images are called will change
 """
 
 import argparse
@@ -34,7 +35,7 @@ def main(args):
             # Will not use processor and tokenizer for now. Loading output ids directly
             hidden_states = answers["hidden_states_list"][i]
 
-            logits = model.gen_head(hidden_states[:, -1, :].cuda())
+            logits = model.gen_head(hidden_states[:, -1, :].to(device=model.gen_head.device))
             assert torch.isclose(logits.cpu(), answers["logit_list"][i], atol=1e-3).all()
             # Use this to increase precision thereafter
             logits = answers["logit_list"][i].cuda()
@@ -50,14 +51,16 @@ def main(args):
             generated_tokens[:, i] = next_token.squeeze(dim=-1)
 
             next_token = torch.cat([next_token.unsqueeze(dim=1), next_token.unsqueeze(dim=1)], dim=1).view(-1)
-            img_embeds = model.gen_aligner(model.gen_embed(next_token))
+            img_embeds = model.gen_aligner(model.gen_embed(next_token.to(device=model.gen_embed.weight.device))
+                                           .to(device=model.gen_aligner.device)
+                                           )
             inputs_embeds = img_embeds.unsqueeze(dim=1)
 
             assert torch.isclose(inputs_embeds.cpu(), answers["inputs_embeds_list"][i], atol=1e-3).all()
             # No need for the following, as llm is being abstracted away
             # inputs_embeds = answers["inputs_embeds_list"][i].cuda()
 
-    dec = model.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.int),
+    dec = model.gen_vision.decode_code(generated_tokens.to(dtype=torch.int, device=model.gen_vision.device),
                                                 shape=[parallel_size, 8, img_size // patch_size, img_size // patch_size])
     assert torch.isclose(dec.cpu(), answers["dec"], atol=1e-3).all()
     # No need for the rest of the code, they are all operations that do not depend on the model
@@ -66,10 +69,10 @@ if __name__ == '__main__':
     # Create the args with argument parser
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path",
-                        help="Local directory to get pretrained weights",
+                        help="Local directory to get pretrained weights from",
                         )
     parser.add_argument("--answers_file",
-                        help="Local directory to save the model weights",
+                        help="Local directory to save the model weights to",
                         )
     args = parser.parse_args()
     main(args)
