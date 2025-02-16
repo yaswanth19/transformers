@@ -15,7 +15,13 @@ from ...activations import ACT2FN
 from ...generation import GenerationMixin
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from ...modeling_utils import PreTrainedModel
-from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusVisionEncoderConfig
+from .configuration_janus import (
+    JanusConfig,
+    JanusGenAlignerConfig,
+    JanusGenHeadConfig,
+    JanusGenVisionConfig,
+    JanusVisionEncoderConfig,
+)
 
 
 def janus_gen_vision_nonlinearity(x):
@@ -398,8 +404,16 @@ class JanusGenVision(PreTrainedModel):
     base_model_prefix = "janus_gen_vision"
     main_input_name = "pixel_values"
 
+    _no_split_modules = [
+        "JanusGenVisionEncoder",
+        "JanusGenVisionDecoder",
+        "JanusGenVisionVectorQuantizer",
+        "JanusGenVisionResnetBlock",
+        "JanusGenVisionAttnBlock",
+    ]
+
     def __init__(self, config: JanusGenVisionConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.encoder = JanusGenVisionEncoder(
             ch_mult=config.encoder_ch_mult,
@@ -446,19 +460,116 @@ class JanusGenVision(PreTrainedModel):
         return dec, diff
 
 
+class JanusGenHead(PreTrainedModel):
+    config_class = JanusGenHeadConfig
+    base_model_prefix = "janus_gen_head"
+
+    def __init__(self, config: JanusGenHeadConfig):
+        super().__init__(config)
+        self.output_mlp_projector = torch.nn.Linear(config.n_embed, config.image_token_embed)
+        self.vision_activation = torch.nn.GELU()
+        self.vision_head = torch.nn.Linear(config.image_token_embed, config.image_token_size)
+
+    def forward(self, x):
+        x = self.output_mlp_projector(x)
+        x = self.vision_activation(x)
+        x = self.vision_head(x)
+        return x
+
+
+class JanusGenAligner(PreTrainedModel):
+    config_class = JanusGenAlignerConfig
+    base_model_prefix = "janus_gen_aligner"
+
+    def __init__(self, config: JanusGenAlignerConfig):
+        super().__init__(config)
+
+        if config.projector_type == "identity":
+            modules = nn.Identity()
+
+        elif config.projector_type == "linear":
+            modules = nn.Linear(config.input_dim, config.n_embed)
+
+        elif config.projector_type == "mlp_gelu":
+            mlp_depth = getattr(config, "depth", 1)
+            modules = [nn.Linear(config.input_dim, config.n_embed)]
+            for _ in range(1, mlp_depth):
+                modules.append(nn.GELU())
+                modules.append(nn.Linear(config.n_embed, config.n_embed))
+            modules = nn.Sequential(*modules)
+
+        elif config.projector_type == "low_high_hybrid_split_mlp_gelu":
+            mlp_depth = getattr(config, "depth", 1)
+            self.high_up_proj = nn.Linear(config.input_dim, config.n_embed // 2)
+            self.low_up_proj = nn.Linear(config.input_dim, config.n_embed // 2)
+
+            modules = []
+            for _ in range(1, mlp_depth):
+                modules.append(nn.GELU())
+                modules.append(nn.Linear(config.n_embed, config.n_embed))
+            modules = nn.Sequential(*modules)
+
+        else:
+            raise ValueError(f"Unknown projector type: {config.projector_type}")
+
+        self.layers = modules
+
+    def forward(self, x_or_tuple: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]):
+        """
+        Args:
+            x_or_tuple (Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:  if it is a tuple of torch.Tensor,
+                then it comes from the hybrid vision encoder, and x = high_res_x, low_res_x);
+                otherwise it is the feature from the single vision encoder.
+
+        Returns:
+            x (torch.Tensor): [b, s, c]
+        """
+
+        if isinstance(x_or_tuple, tuple):
+            # config.projector_type == "low_high_hybrid_split_mlp_gelu":
+            high_x, low_x = x_or_tuple
+            high_x = self.high_up_proj(high_x)
+            low_x = self.low_up_proj(low_x)
+            x = torch.concat([high_x, low_x], dim=-1)
+        else:
+            x = x_or_tuple
+
+        return self.layers(x)
+
+
 class JanusPreTrainedModel(PreTrainedModel):
     config_class = JanusConfig
     base_model_prefix = "janus"
+    _no_split_modules = [
+        "JanusGenHead",
+        "JanusGenAligner",
+    ]
 
     def _init_weights(self, module):
         pass
 
 
-class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
-    config_class = JanusConfig
-
+class JanusForCausalLM(JanusPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
+
+    def forward(self, **kwargs):
+        pass
+
+
+class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
+    def __init__(self, config):
+        super().__init__(config)
+        self.text_model = JanusForCausalLM._from_config(config.text_config)
+        self.gen_head = JanusGenHead(config.gen_head_config)
+        self.gen_aligner = JanusGenAligner(config.gen_aligner_config)
+        self.gen_vision = JanusGenVision(config.gen_vision_config)
+        self.gen_embed = torch.nn.Embedding(
+            config.gen_vision_config.image_token_size, config.gen_vision_config.n_embed
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
 
     def forward(self, **kwargs):
         pass
@@ -1011,4 +1122,4 @@ class JanusVisionEncoderTransformer(nn.Module):
         )
 
 
-__all__ = ["JanusGenVision", "JanusPreTrainedModel", "JanusForConditionalGeneration"]
+__all__ = ["JanusGenVision", "JanusPreTrainedModel", "JanusForConditionalGeneration", "JanusForCausalLM"]

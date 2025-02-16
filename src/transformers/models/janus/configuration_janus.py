@@ -336,6 +336,8 @@ class JanusGenVisionConfig(PretrainedConfig):
         decoder_ch_mult: Optional[List[int]] = None,
         z_channels: int = 256,
         dropout_p: float = 0.0,
+        image_token_size: int = 16384,
+        n_embed: int = 8,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -349,6 +351,8 @@ class JanusGenVisionConfig(PretrainedConfig):
         self.entropy_loss_ratio = entropy_loss_ratio
         self.z_channels = z_channels
         self.dropout_p = dropout_p
+        self.image_token_size = image_token_size
+        self.n_embed = n_embed
 
 
 class JanusConfig(PretrainedConfig):

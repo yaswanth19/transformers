@@ -13,10 +13,15 @@
 # limitations under the License.
 import argparse
 import glob
+import json
+import re
+from pathlib import Path
 
 import torch
+from accelerate import init_empty_weights
 from huggingface_hub import file_exists, hf_hub_download, snapshot_download
 from safetensors import safe_open
+from safetensors.torch import load_file
 
 from transformers import (
     AddedToken,
@@ -26,12 +31,11 @@ from transformers import (
     JanusConfig,
     JanusForConditionalGeneration,
     LlavaProcessor,
-    SiglipVisionConfig,
+    SiglipVisionConfig, AutoModelForCausalLM,
 )
 
-
 EPILOG_TXT = """Example:
-    python transformers/src/transformers/models/janus/convert_janus_weights_to_hf.py --text_model_id lmsys/vicuna-7b-v1.5 --vision_model_id openai/clip-vit-large-patch14-336 --output_hub_path org/janus-v1.5-7b-conv --old_state_dict_id deepseek-ai/Janus-Pro-7B
+    python transformers/src/transformers/models/janus/convert_janus_weights_to_hf.py --text_model_id lmsys/vicuna-7b-v1.5 --vision_model_id openai/clip-vit-large-patch14-336 --output_hub_path org/janus-v1.5-7b-conv --old_state_dict_id liuhaotian/janus-v1.5-7b
 
 Example for creating the old state dict file with Python:
 
@@ -50,15 +54,7 @@ Example for creating the old state dict file with Python:
 """
 
 KEYS_TO_MODIFY_MAPPING = {
-    "model.vision_tower.": "",
-    ".vision_resampler": "",  # all lmms-lab models do avg pooling, so no vision_resampler
-    "model.mm_projector": "multi_modal_projector",
-    "model": "model.model",
-    "vision_model.model": "vision_model",
-    "lm_head": "language_model.lm_head",
-    "model.model": "language_model.model",
-    "multi_modal_projector.0": "multi_modal_projector.linear_1",
-    "multi_modal_projector.2": "multi_modal_projector.linear_2",
+    r"^gen_vision_model\.": "gen_vision.",
 }
 
 
@@ -82,6 +78,18 @@ def load_original_state_dict(model_id):
     return original_state_dict
 
 
+def load_sharded_safetensors(model_dir):
+    # Initialize an empty state dict
+    state_dict = {}
+
+    # Load all shards
+    for shard_file in Path(model_dir).glob('model-*.safetensors'):
+        current_shard = load_file(shard_file)
+        state_dict.update(current_shard)
+
+    return state_dict
+
+
 # used only for janus-interlave
 # for ex: Qwen/Qwen1.5-0.5B-Chat google/siglip-so400m-patch14-384 lmms-lab/janus-next-interleave-qwen-0.5b
 def convert_state_dict_to_hf(state_dict):
@@ -89,15 +97,14 @@ def convert_state_dict_to_hf(state_dict):
     for key, value in state_dict.items():
         if key.endswith(".inv_freq"):
             continue
-        for key_to_modify, new_key in KEYS_TO_MODIFY_MAPPING.items():
-            if key_to_modify in key:
-                key = key.replace(key_to_modify, new_key)
+        for old_pattern, new_pattern in KEYS_TO_MODIFY_MAPPING.items():
+            key = re.sub(old_pattern, new_pattern, key)
 
         new_state_dict[key] = value
     return new_state_dict
 
 
-def convert_janus_llama_to_hf(text_model_id, vision_model_id, output_hub_path, old_state_dict_id):
+def convert_janus_llama_to_hf(text_model_id, vision_model_id, old_janus_folder, output_hub_path, output_dir):
     torch.set_default_dtype(torch.float16)
     text_config = AutoConfig.from_pretrained(text_model_id)
 
@@ -123,8 +130,8 @@ def convert_janus_llama_to_hf(text_model_id, vision_model_id, output_hub_path, o
         vision_config = None
 
     """
-    TODO: I added .to_dict() here because **text_config was not working for text_config of type LlamaConfig. Maybe
-    change later.
+    TMP_COMMENT: I added .to_dict() here because **text_config was not working for text_config of type LlamaConfig. 
+    Maybe change later.
     """
     config = JanusConfig(
         text_config=text_config.to_dict() if text_config else None,
@@ -141,42 +148,20 @@ def convert_janus_llama_to_hf(text_model_id, vision_model_id, output_hub_path, o
         config.pad_token_id = 32001
         config.image_token_index = 32000
 
-    with torch.device("meta"):
+    with init_empty_weights():
         model = JanusForConditionalGeneration(config)
 
-    # Some janus variants like microsoft/janus-med-v1.5-mistral-7b use safetensors to store weights
-    if file_exists(old_state_dict_id, "model_state_dict.bin"):
-        state_dict_path = hf_hub_download(old_state_dict_id, "model_state_dict.bin")
-        state_dict = torch.load(state_dict_path, map_location="cpu", weights_only=True)
-    else:
-        state_dict = load_original_state_dict(old_state_dict_id)
-
+    state_dict = load_sharded_safetensors(old_janus_folder)
     state_dict = convert_state_dict_to_hf(state_dict)
-    model.load_state_dict(state_dict, strict=True, assign=True)
 
-    pre_expansion_embeddings = model.language_model.model.embed_tokens.weight.data
-    mu = torch.mean(pre_expansion_embeddings, dim=0).float()
-    n = pre_expansion_embeddings.size()[0]
-    sigma = ((pre_expansion_embeddings - mu).T @ (pre_expansion_embeddings - mu)) / n
-    dist = torch.distributions.multivariate_normal.MultivariateNormal(mu, covariance_matrix=1e-5 * sigma)
+    # TMP_COMMENT: strict is False, but this is meant to be temporary
+    model.load_state_dict(state_dict, assign=True, strict=False)
+    if output_dir is not None:
+        model.save_pretrained(output_dir, safe_serialization=True)
 
-    # We add an image token so we resize the model and pad to 64 for performance reasons
-    pad_shape = 64
-    vocab_size = config.text_config.vocab_size
-    model.resize_token_embeddings(config.text_config.vocab_size + 2, pad_shape)
-    model.language_model.model.embed_tokens.weight.data[vocab_size:] = torch.stack(
-        tuple(
-            (dist.sample() for _ in range(model.language_model.model.embed_tokens.weight.data[vocab_size:].shape[0]))
-        ),
-        dim=0,
-    )
-    model.language_model.lm_head.weight.data[vocab_size:] = torch.stack(
-        tuple((dist.sample() for _ in range(model.language_model.lm_head.weight.data[vocab_size:].shape[0]))),
-        dim=0,
-    )
-
-    model.push_to_hub(output_hub_path)
-    processor.push_to_hub(output_hub_path)
+    if output_hub_path is not None:
+        model.push_to_hub(output_hub_path)
+        processor.push_to_hub(output_hub_path)
 
 
 def main():
@@ -197,11 +182,19 @@ def main():
         help="Location on the hub of the converted model",
     )
     parser.add_argument(
-        "--old_state_dict_id",
-        help="Location on the hub of the raw state dict of the original model. The filename needs to be `model_state_dict.bin`",
+        "--old_janus_folder",
+        help="Local folder with the original model saved in pytorch safetensors format",
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        help="Location on the hub of the original model",
     )
     args = parser.parse_args()
-    convert_janus_llama_to_hf(args.text_model_id, args.vision_model_id, args.output_hub_path, args.old_state_dict_id)
+    convert_janus_llama_to_hf(args.text_model_id, args.vision_model_id,
+                              args.old_janus_folder, args.output_hub_path,
+                              args.output_dir
+                              )
 
 
 if __name__ == "__main__":
