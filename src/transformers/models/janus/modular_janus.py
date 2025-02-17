@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torch.utils.checkpoint
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from torch.nn.init import _calculate_fan_in_and_fan_out
 
@@ -30,10 +31,6 @@ from ...activations import ACT2FN
 from ...generation import GenerationMixin
 from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 from ...modeling_utils import PreTrainedModel
-from ..dinov2_with_registers.modeling_dinov2_with_registers import (
-    Dinov2WithRegistersDropPath,
-    Dinov2WithRegistersLayerScale,
-from ...generation import GenerationMixin
 from ...utils import (
     ModelOutput,
     add_start_docstrings,
@@ -47,23 +44,23 @@ from ...utils import (
     torch_int,
 )
 
-from ..chameleon.modeling_chameleon import (
-    ChameleonForConditionalGeneration,
-    ChameleonImageVocabularyMapping,
-    ChameleonModel,
-    ChameleonPreTrainedModel,
-    ChameleonVQVAE,
-    ChameleonVQVAEEncoderAttnBlock,
-    ChameleonVQVAEEncoderResnetBlock,
-    ChameleonVQVAEVectorQuantizer,
-    ChameleonVQVAEEncoder,
-    ChameleonVQVAEEncoderConvDownsample
-)
-from .configuration_janus import JanusVisionConfig,JanusConfig,JanusTextConfig, JanusVQVAEConfig
+from .configuration_janus import JanusVisionConfig,JanusConfig,JanusTextConfig
 from ..vit.modeling_vit import ViTPatchEmbeddings
-from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusVisionEncoderConfig, JanusGenHeadConfig, \
+from .configuration_janus import JanusConfig, JanusGenVisionConfig, JanusGenHeadConfig, \
     JanusGenAlignerConfig
 
+from ..dinov2_with_registers.modeling_dinov2_with_registers  import Dinov2WithRegistersLayerScale, Dinov2WithRegistersDropPath
+from ..siglip.modeling_siglip import SiglipEncoder, SiglipVisionTransformer
+from ..llama.modeling_llama import LlamaModel, LlamaForCausalLM
+
+if is_flash_attn_2_available():
+    from ...modeling_flash_attention_utils import _flash_attention_forward
+
+logger = logging.get_logger(__name__)
+
+# General docstring
+_CONFIG_FOR_DOC = "JanusConfig"
+_CHECKPOINT_FOR_DOC = ""
 
 class JanusGenVisionEncoder(nn.Module):
     def __init__(
@@ -577,72 +574,9 @@ class JanusGenAligner(PreTrainedModel):
 
         return self.layers(x)
 
-
-class JanusPreTrainedModel(PreTrainedModel):
-    config_class = JanusConfig
-    base_model_prefix = "janus"
-    _no_split_modules = [
-        "JanusGenHead",
-        "JanusGenAligner",
-    ]
-
-    def _init_weights(self, module):
-        pass
-
-
-class JanusForCausalLM(JanusPreTrainedModel, GenerationMixin):
-    def __init__(self, config):
-        super().__init__(config)
-
-    def forward(self, **kwargs):
-        pass
-
-class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
-    def __init__(self, config):
-        super().__init__(config)
-        self.text_model = JanusForCausalLM._from_config(config.text_config)
-        self.gen_head = JanusGenHead(config.gen_head_config)
-        self.gen_aligner = JanusGenAligner(config.gen_aligner_config)
-        self.gen_vision = JanusGenVision(config.gen_vision_config)
-        self.gen_embed = torch.nn.Embedding(
-            config.gen_vision_config.image_token_size, config.gen_vision_config.n_embed
-        )
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    def forward(self, **kwargs):
-        pass
-
-from ..dinov2_with_registers.modeling_dinov2_with_registers  import Dinov2WithRegistersLayerScale, Dinov2WithRegistersDropPath
-from ..siglip.modeling_siglip import SiglipEncoder, SiglipVisionTransformer, SiglipVisionModel, SiglipMultiheadAttentionPoolingHead
-from ..llama.modeling_llama import LlamaModel, LlamaForCausalLM
-
-if is_flash_attn_2_available():
-    from ...modeling_flash_attention_utils import _flash_attention_forward
-
-
-
-if is_torch_available():
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    import torch.utils.checkpoint
-
-logger = logging.get_logger(__name__)
-
-# General docstring
-_CONFIG_FOR_DOC = "JanusConfig"
-_CHECKPOINT_FOR_DOC = ""
-
-
 class JanusVisionPatchEmbeddings(ViTPatchEmbeddings):
     pass
 
-# ToDO: Is interpolate pos embeddings required for this model as of now passing?
-@dataclass
-class JanusVQVAEOutput:
-    pass
 
 class JanusVisionEmbeddings(nn.Module):
     def __init__(self, config:JanusVisionConfig):
@@ -1062,10 +996,6 @@ class JanusVisionEncoder(SiglipEncoder):
         self.layers = nn.ModuleList([JanusVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
 
-class JanusPreTrainedModel():
-     """An abstract class to load pretrained weigths"""
-     pass
-
 class JanusVisionTransformer(SiglipVisionTransformer,nn.Module):
     def __init__(self, config: JanusVisionConfig):
         nn.Module.__init__()
@@ -1094,16 +1024,29 @@ class JanusVisionAlignerMLP(nn.Module):
             hidden_states = layer(hidden_states)
         return hidden_states
 
-class JanusImageVocabularyMapping(ChameleonImageVocabularyMapping):
-    @cached_property
-    def bpe2img_mapping_tensor(self):
-        mapping = torch.zeros(max(self.bpe2img.keys()) + 1, dtype=torch.int)
-        for k, v in self.bpe2img.items():
-            mapping[k] = v
-        return mapping
-
 class JanusTextModel(LlamaModel):
     pass
+
+class JanusPreTrainedModel(PreTrainedModel):
+    config_class = JanusConfig
+    base_model_prefix = "janus"
+    _no_split_modules = [
+        "JanusGenHead",
+        "JanusGenAligner",
+    ]
+
+    def _init_weights(self, module):
+        pass
+
+
+class JanusForCausalLM(JanusPreTrainedModel, GenerationMixin):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def forward(self, **kwargs):
+        pass
+
+
 class JanusTextForCausalLM(LlamaForCausalLM, JanusPreTrainedModel, GenerationMixin):
     config_class = JanusTextConfig
 
@@ -1120,11 +1063,15 @@ class JanusForConditionalGeneration(JanusPreTrainedModel, GenerationMixin):
         self.vision_model = JanusVisionTransformer(config.vision_config)
         self.language_model = JanusTextForCausalLM(config.text_config)
         self.aligner = JanusVisionAlignerMLP(config.vision_config)
-        self.vqmodel = JanusVQVAE(config.vq_config)
-        # self.vocabulary_mapping = JanusImageVocabularyMapping(config.vocabulary_map)
+        self.gen_head = JanusGenHead(config.gen_head_config)
+        self.gen_aligner = JanusGenAligner(config.gen_aligner_config)
+        self.gen_vision = JanusGenVision(config.gen_vision_config)
+        self.gen_embed = torch.nn.Embedding(
+            config.gen_vision_config.image_token_size, config.gen_vision_config.n_embed
+        )
 
         # Initialize weights and apply final processing
-        # self.post_init()
+        self.post_init()
 
     def get_input_embeddings(self,input_ids):
         return self.language_model.get_input_embeddings()(input_ids)
