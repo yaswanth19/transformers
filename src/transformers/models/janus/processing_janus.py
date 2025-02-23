@@ -132,6 +132,7 @@ class JanusProcessor(ProcessorMixin):
                 prompt += self.image_start_token
             prompt_strings.append(prompt)
 
+
         data = self.tokenizer(prompt_strings, **output_kwargs["text_kwargs"])
 
         # Process images if pixel values are provided.
